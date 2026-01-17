@@ -5,6 +5,7 @@ import os
 import urllib.request
 import time
 import threading
+from collections import deque
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from deepface import DeepFace
@@ -25,48 +26,185 @@ options = vision.FaceLandmarkerOptions(
 )
 detector = vision.FaceLandmarker.create_from_options(options)
 
-# 인덱스 및 전역 변수 설정
+# 인덱스 및 개별 상태 관리 변수
 L_IRIS, R_IRIS = 468, 473
 L_INNER, L_OUTER = 133, 33
+L_TOP, L_BOTTOM = 159, 145
+R_TOP, R_BOTTOM = 386, 374
 R_INNER, R_OUTER = 362, 263
 
-faces_data = {}  # 분석 결과 저장소
-is_analyzing = False  # 현재 분석 중인지 확인하는 플래그
+# ==================== 감정 분석 개선 시작 ====================
+
+# 감정 히스토리 저장 (각 얼굴별)
+emotion_histories = {}
+HISTORY_SIZE = 10  # 최근 10개 프레임 저장
+
+# 감정 가중치 - 5가지 사용
+EMOTION_WEIGHTS = {
+    'angry': 1.2,      # 부정 감정 대표
+    'happy': 1.0,      # 긍정 감정 대표
+    'sad': 1.1,        # 슬픈 감정
+    'surprise': 0.95,  # 놀람 (약간 낮게)
+    'neutral': 0.7     # 무표정
+}
+
+# 신뢰도 임계값
+CONFIDENCE_THRESHOLD = 0.25
+
+def apply_emotion_weights(emotion_scores):
+    """감정 점수에 가중치 적용"""
+    weighted = {}
+    for emotion, score in emotion_scores.items():
+        weight = EMOTION_WEIGHTS.get(emotion, 1.0)
+        weighted[emotion] = score * weight
+    return weighted
+
+def get_smoothed_emotion(face_id, raw_emotion_data):
+    """
+    시계열 평활화로 안정적인 감정 반환 (5가지 감정으로 단순화)
+    - fear, disgust는 angry로 통합
+    
+    Args:
+        face_id: 얼굴 ID
+        raw_emotion_data: DeepFace 원본 결과의 emotion dict (7가지)
+    
+    Returns:
+        tuple: (smoothed_emotion, confidence) - 5가지 중 하나
+    """
+    # 히스토리 초기화
+    if face_id not in emotion_histories:
+        emotion_histories[face_id] = deque(maxlen=HISTORY_SIZE)
+    
+    # ========== 감정 단순화: 7가지 → 5가지 ==========
+    simplified_emotion = {
+        'angry': 0,
+        'happy': 0,
+        'sad': 0,
+        'surprise': 0,
+        'neutral': 0
+    }
+    
+    # fear와 disgust를 angry로 통합 (80% 비율로 합산)
+    simplified_emotion['angry'] = (
+        raw_emotion_data.get('angry', 0) +
+        raw_emotion_data.get('fear', 0) * 0.8 +
+        raw_emotion_data.get('disgust', 0) * 0.8
+    )
+    
+    # 나머지 감정은 그대로 사용
+    simplified_emotion['happy'] = raw_emotion_data.get('happy', 0)
+    simplified_emotion['sad'] = raw_emotion_data.get('sad', 0)
+    simplified_emotion['surprise'] = raw_emotion_data.get('surprise', 0)
+    simplified_emotion['neutral'] = raw_emotion_data.get('neutral', 0)
+    # ================================================
+    
+    # 가중치 적용 (단순화된 5가지 감정에 적용)
+    weighted_scores = apply_emotion_weights(simplified_emotion)
+    
+    # 현재 감정의 주요 감정과 점수
+    current_emotion = max(weighted_scores, key=weighted_scores.get)
+    current_score = weighted_scores[current_emotion] / 100.0
+    
+    # 신뢰도가 너무 낮으면 히스토리에 추가하지 않음
+    if current_score >= CONFIDENCE_THRESHOLD:
+        emotion_histories[face_id].append(weighted_scores)
+    
+    # 히스토리가 충분하지 않으면 현재 값 사용
+    if len(emotion_histories[face_id]) < 3:
+        return current_emotion, weighted_scores[current_emotion]
+    
+    # 가중 평균 계산 (최근일수록 가중치 높음)
+    emotion_sums = {}
+    total_weight = 0
+    
+    for i, scores in enumerate(emotion_histories[face_id]):
+        weight = (i + 1) / len(emotion_histories[face_id])  # 최근일수록 가중치 증가
+        total_weight += weight
+        
+        for emotion, score in scores.items():
+            emotion_sums[emotion] = emotion_sums.get(emotion, 0) + (score * weight)
+    
+    # 가중 평균
+    emotion_avgs = {k: v / total_weight for k, v in emotion_sums.items()}
+    
+    # 최종 감정 결정
+    smoothed_emotion = max(emotion_avgs, key=emotion_avgs.get)
+    smoothed_confidence = emotion_avgs[smoothed_emotion]
+    
+    return smoothed_emotion, smoothed_confidence
+# ==================== 감정 분석 개선 끝 ====================
+
+# [핵심 수정] 각 ID별로 데이터와 분석 중인지 여부를 개별 저장
+# 예: faces_status[0] = {'data': {...}, 'is_analyzing': False}
+faces_status = {i: {'data': None, 'is_analyzing': False} for i in range(4)}
 
 def get_detailed_gaze(landmarks):
-    """상하좌우 중심 시선 판별"""
-    res_h, res_v = "", ""
-    for iris_idx, inner_idx, outer_idx in [(L_IRIS, L_INNER, L_OUTER), (R_IRIS, R_INNER, R_OUTER)]:
-        iris, inner, outer = landmarks[iris_idx], landmarks[inner_idx], landmarks[outer_idx]
-        dx, dy = iris.x - (inner.x + outer.x)/2, iris.y - (inner.y + outer.y)/2
-        if dx < -0.006: res_h = "Right"
-        elif dx > 0.006: res_h = "Left"
-        if dy < -0.005: res_v = "Up"
-        elif dy > 0.005: res_v = "Down"
+    """Ratio 기반 시선 추적"""
+    avg_h_ratio, avg_v_ratio = 0, 0
+    eyes_indices = [
+        (L_IRIS, L_INNER, L_OUTER, L_TOP, L_BOTTOM),
+        (R_IRIS, R_INNER, R_OUTER, R_TOP, R_BOTTOM)
+    ]
     
-    h_part = res_h if res_h else ""
-    v_part = res_v if res_v else ""
-    final = f"{h_part} {v_part}".strip()
-    return final if final else "Center"
+    for iris_idx, inner_idx, outer_idx, top_idx, bottom_idx in eyes_indices:
+        iris, inner, outer, top, bottom = landmarks[iris_idx], landmarks[inner_idx], landmarks[outer_idx], landmarks[top_idx], landmarks[bottom_idx]
+        eye_width = ((outer.x - inner.x)**2 + (outer.y - inner.y)**2)**0.5
+        if eye_width == 0: continue
+        dist_to_inner = ((iris.x - inner.x)**2 + (iris.y - inner.y)**2)**0.5
+        h_ratio = dist_to_inner / eye_width
+        eye_height = ((bottom.x - top.x)**2 + (bottom.y - top.y)**2)**0.5
+        if eye_height == 0: continue
+        dist_to_top = ((iris.x - top.x)**2 + (iris.y - top.y)**2)**0.5
+        v_ratio = dist_to_top / eye_height
+        avg_h_ratio += h_ratio
+        avg_v_ratio += v_ratio
+
+    avg_h_ratio /= 2
+    avg_v_ratio /= 2
+    h_dir, v_dir = "", ""
+    if avg_h_ratio < 0.42: h_dir = "Right"
+    elif avg_h_ratio > 0.58: h_dir = "Left"
+    if avg_v_ratio < 0.38: v_dir = "Up"
+    elif avg_v_ratio > 0.55: v_dir = "Down"
+    
+    if h_dir == "" and v_dir == "": return "Center"
+    return f"{h_dir} {v_dir}".strip()
 
 def draw_styled_panel(img, x, y, w, h, alpha=0.6):
-    """정보창을 위한 반투명 패널"""
     overlay = img.copy()
     cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 0, 0), -1)
     return cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0)
 
+# ==================== 감정 분석 함수 수정 ====================
 def background_analysis(crop_img, idx):
-    """DeepFace 분석을 수행하는 백그라운드 함수"""
-    global faces_data, is_analyzing
+    """[수정] 특정 인덱스의 얼굴만 개별적으로 분석하는 스레드 함수 - 감정 개선 적용"""
+    global faces_status
     try:
-        # 실행 시간을 잡아먹는 주범 (DeepFace 연산)
-        result = DeepFace.analyze(crop_img, actions=['age', 'gender', 'emotion'], 
-                                  enforce_detection=False, silent=True)[0]
-        faces_data[idx] = result
+        # RetinaFace 사용으로 더 정확한 분석
+        result = DeepFace.analyze(
+            crop_img, 
+            actions=['age', 'gender', 'emotion'],
+            enforce_detection=False, 
+            silent=True,
+            detector_backend='opencv'  # 더 정확한 검출기
+        )[0]
+        
+        # 감정 평활화 적용
+        raw_emotion = result['emotion']
+        smoothed_emotion, smoothed_conf = get_smoothed_emotion(idx, raw_emotion)
+        
+        # 개선된 감정 정보 추가
+        result['smoothed_emotion'] = smoothed_emotion
+        result['smoothed_confidence'] = smoothed_conf
+        
+        # 해당 인덱스 슬롯에 결과 저장
+        faces_status[idx]['data'] = result
     except Exception as e:
-        print(f"Analysis Error: {e}")
+        print(f"Analysis Error for ID {idx+1}: {e}")
     finally:
-        is_analyzing = False # 분석 완료 후 플래그 해제
+        # 해당 인덱스 분석 종료 알림
+        faces_status[idx]['is_analyzing'] = False
+# ==================== 감정 분석 함수 수정 끝 ====================
 
 cap = cv2.VideoCapture(0)
 frame_count = 0
@@ -76,7 +214,6 @@ while cap.isOpened():
     success, frame = cap.read()
     if not success: break
     
-    # FPS 계산
     curr_time = time.time()
     fps = 1 / (curr_time - prev_time) if prev_time != 0 else 0
     prev_time = curr_time
@@ -86,50 +223,72 @@ while cap.isOpened():
     timestamp_ms = int(cap.get(cv2.CAP_PROP_POS_MSEC))
     if timestamp_ms == 0: timestamp_ms = frame_count * 33
     
-    # 1. MediaPipe 시선 추적 (매우 빠름)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
     result = detector.detect_for_video(mp_image, timestamp_ms)
 
+    # 상단 대시보드
     num_detected = len(result.face_landmarks) if result.face_landmarks else 0
-    frame = draw_styled_panel(frame, 10, 10, 320, 40 + (num_detected * 85) if num_detected > 0 else 40)
-    cv2.putText(frame, "LIVE MONITOR", (20, 35), cv2.FONT_HERSHEY_TRIPLEX, 0.7, (0, 255, 0), 1, cv2.LINE_AA)
-    cv2.putText(frame, f"FPS: {int(fps)}", (240, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
+    frame = draw_styled_panel(frame, 10, 10, 320, 45 + (num_detected * 85))
+    cv2.putText(frame, "INDIVIDUAL LIVE MONITOR", (20, 35), cv2.FONT_HERSHEY_TRIPLEX, 0.6, (0, 255, 0), 1)
+    cv2.putText(frame, f"FPS: {int(fps)}", (350, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
     if result.face_landmarks:
         for idx, landmarks in enumerate(result.face_landmarks):
+            if idx >= 4: break # 설정한 num_faces=4 까지만 처리
+            
             gaze = get_detailed_gaze(landmarks)
             x_pts = [l.x * w for l in landmarks]
             y_pts = [l.y * h for l in landmarks]
             x1, y1, x2, y2 = int(min(x_pts)), int(min(y_pts)), int(max(x_pts)), int(max(y_pts))
 
-            # 2. 비동기 분석 실행 (25프레임마다 + 현재 분석 중이 아닐 때만)
-            if frame_count % 25 == 0 and not is_analyzing:
+            # ==================== 분석 주기 수정 (20프레임마다로 변경) ====================
+            # [수정] 개별 분석 로직: 이 ID(idx)가 현재 분석 중이 아닐 때만 20프레임마다 실행
+            if (frame_count % 20 == 0 or frame_count < 5) and not faces_status[idx]['is_analyzing']:
                 margin = int((x2-x1)*0.2)
                 crop = frame[max(0, y1-margin):min(h, y2+margin), max(0, x1-margin):min(w, x2+margin)]
                 if crop.size > 0:
-                    is_analyzing = True
-                    # 별도 스레드에서 DeepFace 실행
+                    faces_status[idx]['is_analyzing'] = True
                     threading.Thread(target=background_analysis, args=(crop.copy(), idx), daemon=True).start()
-
-            # 3. 화면 UI 표시 (기존 분석 결과가 있으면 표시)
-            panel_y = 60 + (idx * 85)
-            cv2.line(frame, (20, panel_y-5), (300, panel_y-5), (50, 50, 50), 1)
+            # ==================== 분석 주기 수정 끝 ====================
             
-            if idx in faces_data:
-                d = faces_data[idx]
-                attr = f"ID:{idx+1} | {d['dominant_gender'][0]} | {d['age']}s"
-                emo = f"Emotion: {d['dominant_emotion'].upper()}"
-                cv2.putText(frame, attr, (25, panel_y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
-                cv2.putText(frame, emo, (25, panel_y + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+            # UI 표시 로직
+            panel_y = 65 + (idx * 85)
+            cv2.line(frame, (20, panel_y-5), (300, panel_y-5), (80, 80, 80), 1)
             
-            cv2.putText(frame, f"Gaze: {gaze}", (25, panel_y + 70), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 1)
-            cv2.putText(frame, str(idx + 1), (x1, y1 - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+            # ==================== 감정 표시 수정 ====================
+            # 각 ID별 저장된 데이터 가져와서 표시
+            if faces_status[idx]['data']:
+                d = faces_status[idx]['data']
+                gender = "M" if d['dominant_gender'] == 'Man' else "W"
+                info = f"ID:{idx+1} | {gender} | {d['age']}s"
+                
+                # 평활화된 감정 사용 (있으면)
+                if 'smoothed_emotion' in d:
+                    display_emotion = d['smoothed_emotion']
+                    display_conf = d['smoothed_confidence']
+                    emo = f"Emotion: {display_emotion.upper()} ({display_conf:.0f}%)"
+                else:
+                    emo = f"Emotion: {d['dominant_emotion'].upper()}"
+                
+                cv2.putText(frame, info, (25, panel_y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(frame, emo, (25, panel_y + 42), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            else:
+                cv2.putText(frame, f"ID:{idx+1} Initializing...", (25, panel_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+            # ==================== 감정 표시 수정 끝 ====================
+            
+            cv2.putText(frame, f"Gaze: {gaze}", (25, panel_y + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            
+            # 얼굴 박스 및 번호 (분석 중일 때는 노란색으로 표시)
+            box_color = (0, 255, 255) if faces_status[idx]['is_analyzing'] else (0, 255, 0)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 1)
+            cv2.putText(frame, f"FACE {idx+1}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 1)
+            
+            # 눈동자 포인트
             for i_idx in [L_IRIS, R_IRIS]:
                 p = landmarks[i_idx]
                 cv2.circle(frame, (int(p.x * w), int(p.y * h)), 2, (0, 255, 255), -1)
 
-    cv2.imshow('Face Dashboard (Threaded)', frame)
+    cv2.imshow('Face Dashboard (Individual Analysis)', frame)
     if cv2.waitKey(1) & 0xFF == 27: break
 
 cap.release()
