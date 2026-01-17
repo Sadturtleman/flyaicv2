@@ -144,46 +144,44 @@ def get_smoothed_emotion(face_id, raw_emotion_data):
 # ==================== 감정 분석 개선 끝 ====================
 
 def get_head_pose_ratio(landmarks):
-    """
-    얼굴이 좌우/상하로 얼마나 돌아갔는지 비율로 계산
-    반환값: (yaw_ratio, pitch_ratio)
-    """
     nose = landmarks[NOSE_TIP]
     l_ear = landmarks[L_EAR]
     r_ear = landmarks[R_EAR]
     
-    # 1. Yaw (좌우 회전) 계산
-    # 양쪽 귀 사이의 거리
+    # Yaw (좌우)
     face_width = ((r_ear.x - l_ear.x)**2 + (r_ear.y - l_ear.y)**2)**0.5
     if face_width == 0: return 0.5, 0.5
+    yaw_ratio = (nose.x - l_ear.x) / (r_ear.x - l_ear.x) # 0.5가 정면
     
-    # 코가 양쪽 귀 중앙에서 얼마나 벗어났는지 확인
-    yaw_ratio = (nose.x - l_ear.x) / (r_ear.x - l_ear.x)
-    
-    # 2. Pitch (상하 회전) - 약식 계산
+    # Pitch (상하)
     mid_ear_y = (l_ear.y + r_ear.y) / 2
-    pitch_val = nose.y - mid_ear_y
+    pitch_val = nose.y - mid_ear_y # 양수=Down, 음수=Up
     
     return yaw_ratio, pitch_val
 
 def get_detailed_gaze(landmarks):
-    """
-    [개선됨] 머리 방향(1순위) + 눈동자(2순위) 하이브리드 추적
-    """
     global gaze_buffer
     
-    # 1. 머리 방향(Head Pose) 분석
+    # 1. 머리 방향 먼저 계산
     yaw, pitch = get_head_pose_ratio(landmarks)
     
-    # 2. 눈동자(Eye Gaze) 분석
-    avg_h_ratio, avg_v_ratio = 0, 0
-    eyes_indices = [
-        (L_IRIS, L_INNER, L_OUTER, L_TOP, L_BOTTOM),
-        (R_IRIS, R_INNER, R_OUTER, R_TOP, R_BOTTOM)
-    ]
+    # [눈 선택 로직] 고개를 많이 돌렸을 때 반대쪽 눈 무시 (기존 동일)
+    target_eyes = []
     
+    if yaw > 0.65:   # Left Turn -> Left Eye Used
+        target_eyes = [(L_IRIS, L_INNER, L_OUTER, L_TOP, L_BOTTOM)]
+    elif yaw < 0.35: # Right Turn -> Right Eye Used
+        target_eyes = [(R_IRIS, R_INNER, R_OUTER, R_TOP, R_BOTTOM)]
+    else:            # Front -> Both Eyes
+        target_eyes = [
+            (L_IRIS, L_INNER, L_OUTER, L_TOP, L_BOTTOM),
+            (R_IRIS, R_INNER, R_OUTER, R_TOP, R_BOTTOM)
+        ]
+
+    avg_h_ratio, avg_v_ratio = 0, 0
     valid_eyes = 0
-    for iris_idx, inner_idx, outer_idx, top_idx, bottom_idx in eyes_indices:
+    
+    for iris_idx, inner_idx, outer_idx, top_idx, bottom_idx in target_eyes:
         iris = landmarks[iris_idx]
         inner = landmarks[inner_idx]
         outer = landmarks[outer_idx]
@@ -202,31 +200,50 @@ def get_detailed_gaze(landmarks):
         avg_h_ratio /= valid_eyes
         avg_v_ratio /= valid_eyes
     
-    # 3. 최종 판단 로직
-    final_h, final_v = "", ""
-
-    # 좌우 판단
-    if yaw < 0.40:    final_h = "Right"
-    elif yaw > 0.60:  final_h = "Left"
-    else:
-        if avg_h_ratio < 0.44: final_h = "Right"
-        elif avg_h_ratio > 0.56: final_h = "Left"
+    # ### 빨간박스 ######################################################################
+    # [수정됨] Center 범위를 넓히기 위해 임계값(Threshold) 완화
+    # 목표: 정면을 보고 있을 때 'Left Down' 같은 오탐지 줄이기
     
-    # 상하 판단
-    if pitch < -0.05:   final_v = "Up"
-    elif pitch > 0.04:  final_v = "Down"
-    else:
-        if avg_v_ratio < 0.38: final_v = "Up"
-        elif avg_v_ratio > 0.52: final_v = "Down"
+    final_h = ""
+    final_v = ""
 
-    res = f"{final_h} {final_v}".strip()
+    # (A) 수평(Horizontal) 판단
+    # Head Yaw 범위 확장: 0.35/0.65 -> 0.32/0.68 (머리를 좀 더 돌려야 인식)
+    if yaw < 0.32:      final_h = "Right" 
+    elif yaw > 0.68:    final_h = "Left"
+    else:
+        # Eye Ratio 범위 확장: 0.46/0.54 -> 0.43/0.57
+        # 이제 0.43 ~ 0.57 사이는 전부 Center로 간주함 (안전지대 확대)
+        if avg_h_ratio < 0.43: final_h = "Right"
+        elif avg_h_ratio > 0.57: final_h = "Left"
+
+    # (B) 수직(Vertical) 판단
+    # Head Pitch 범위 확장: -0.06/0.05 -> -0.08/0.08
+    if pitch < -0.08:     final_v = "Up"
+    elif pitch > 0.08:    final_v = "Down"
+    else:
+        # Eye Ratio 범위 확장
+        # Up: 0.42 이하 (유지 - 위쪽 보기는 원래 힘듦)
+        # Down: 0.53 -> 0.56 (아래쪽 보기는 너무 민감해서 기준을 높임)
+        if avg_v_ratio < 0.42: final_v = "Up"
+        elif avg_v_ratio > 0.56: final_v = "Down" # 0.56 넘어야 Down
+
+    # 결과 문자열 조합
+    res_parts = []
+    if final_h: res_parts.append(final_h)
+    if final_v: res_parts.append(final_v)
+    
+    res = " ".join(res_parts)
     if res == "": res = "Center"
+    # ### 빨간박스 ######################################################################
     
-    # 4. 스무딩
+    # 스무딩
     gaze_buffer.append(res)
     final_res = max(set(gaze_buffer), key=gaze_buffer.count)
     
-    return final_res
+    debug_str = f"Y:{yaw:.2f} P:{pitch:.2f} EyeV:{avg_v_ratio:.2f}"
+    
+    return final_res, debug_str
 
 # [핵심 수정] 각 ID별로 데이터와 분석 중인지 여부를 개별 저장
 faces_status = {i: {'data': None, 'is_analyzing': False} for i in range(4)}
