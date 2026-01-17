@@ -8,7 +8,7 @@ import threading
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from deepface import DeepFace
-
+from collections import deque
 # 1. 모델 설정 및 다운로드
 MODEL_FILE = 'face_landmarker.task'
 if not os.path.exists(MODEL_FILE):
@@ -25,48 +25,124 @@ options = vision.FaceLandmarkerOptions(
 )
 detector = vision.FaceLandmarker.create_from_options(options)
 
-# 인덱스 및 개별 상태 관리 변수
+# 눈 관련
 L_IRIS, R_IRIS = 468, 473
 L_INNER, L_OUTER = 133, 33
+R_INNER, R_OUTER = 362, 263
 L_TOP, L_BOTTOM = 159, 145
 R_TOP, R_BOTTOM = 386, 374
-R_INNER, R_OUTER = 362, 263
 
-# [핵심 수정] 각 ID별로 데이터와 분석 중인지 여부를 개별 저장
-# 예: faces_status[0] = {'data': {...}, 'is_analyzing': False}
-faces_status = {i: {'data': None, 'is_analyzing': False} for i in range(4)}
+# 머리 방향(Head Pose) 관련 (코 끝, 양쪽 귀 근처)
+NOSE_TIP = 1
+L_EAR = 234  # 왼쪽 광대/귀 쪽
+R_EAR = 454  # 오른쪽 광대/귀 쪽
+
+# [안정화] 최근 5프레임의 데이터를 저장할 버퍼 (떨림 방지용)
+gaze_buffer = deque(maxlen=5)
+
+def get_head_pose_ratio(landmarks):
+    """
+    얼굴이 좌우/상하로 얼마나 돌아갔는지 비율로 계산
+    반환값: (yaw_ratio, pitch_ratio)
+    """
+    nose = landmarks[NOSE_TIP]
+    l_ear = landmarks[L_EAR]
+    r_ear = landmarks[R_EAR]
+    
+    # 1. Yaw (좌우 회전) 계산
+    # 양쪽 귀 사이의 거리
+    face_width = ((r_ear.x - l_ear.x)**2 + (r_ear.y - l_ear.y)**2)**0.5
+    if face_width == 0: return 0.5, 0.5
+    
+    # 코가 양쪽 귀 중앙에서 얼마나 벗어났는지 확인
+    # 0.0(Left) ~ 0.5(Center) ~ 1.0(Right)
+    # (이미지 기준 Left/Right이므로 실제 사용자 기준과는 반대일 수 있음 -> 아래 로직에서 보정)
+    yaw_ratio = (nose.x - l_ear.x) / (r_ear.x - l_ear.x)
+    
+    # 2. Pitch (상하 회전) - 약식 계산
+    # 코와 귀의 Y축 관계 이용 (고개 숙이면 코가 귀보다 내려가거나 올라감)
+    mid_ear_y = (l_ear.y + r_ear.y) / 2
+    # 값이 클수록(양수) 코가 귀보다 아래 -> 고개 숙임(Down)
+    # 값이 작을수록(음수) 코가 귀보다 위 -> 고개 듦(Up)
+    pitch_val = nose.y - mid_ear_y
+    
+    return yaw_ratio, pitch_val
 
 def get_detailed_gaze(landmarks):
-    """Ratio 기반 시선 추적"""
+    """
+    [개선됨] 머리 방향(1순위) + 눈동자(2순위) 하이브리드 추적
+    """
+    global gaze_buffer
+    
+    # 1. 머리 방향(Head Pose) 분석
+    yaw, pitch = get_head_pose_ratio(landmarks)
+    
+    # 2. 눈동자(Eye Gaze) 분석 (기존 로직 유지)
     avg_h_ratio, avg_v_ratio = 0, 0
     eyes_indices = [
         (L_IRIS, L_INNER, L_OUTER, L_TOP, L_BOTTOM),
         (R_IRIS, R_INNER, R_OUTER, R_TOP, R_BOTTOM)
     ]
     
+    valid_eyes = 0
     for iris_idx, inner_idx, outer_idx, top_idx, bottom_idx in eyes_indices:
-        iris, inner, outer, top, bottom = landmarks[iris_idx], landmarks[inner_idx], landmarks[outer_idx], landmarks[top_idx], landmarks[bottom_idx]
-        eye_width = ((outer.x - inner.x)**2 + (outer.y - inner.y)**2)**0.5
-        if eye_width == 0: continue
-        dist_to_inner = ((iris.x - inner.x)**2 + (iris.y - inner.y)**2)**0.5
-        h_ratio = dist_to_inner / eye_width
-        eye_height = ((bottom.x - top.x)**2 + (bottom.y - top.y)**2)**0.5
-        if eye_height == 0: continue
-        dist_to_top = ((iris.x - top.x)**2 + (iris.y - top.y)**2)**0.5
-        v_ratio = dist_to_top / eye_height
-        avg_h_ratio += h_ratio
-        avg_v_ratio += v_ratio
+        iris = landmarks[iris_idx]
+        inner = landmarks[inner_idx]
+        outer = landmarks[outer_idx]
+        top = landmarks[top_idx]
+        bottom = landmarks[bottom_idx]
 
-    avg_h_ratio /= 2
-    avg_v_ratio /= 2
-    h_dir, v_dir = "", ""
-    if avg_h_ratio < 0.42: h_dir = "Right"
-    elif avg_h_ratio > 0.58: h_dir = "Left"
-    if avg_v_ratio < 0.38: v_dir = "Up"
-    elif avg_v_ratio > 0.55: v_dir = "Down"
+        ew = ((outer.x - inner.x)**2 + (outer.y - inner.y)**2)**0.5
+        eh = ((bottom.x - top.x)**2 + (bottom.y - top.y)**2)**0.5
+        if ew == 0 or eh == 0: continue
+        
+        avg_h_ratio += ((iris.x - inner.x)**2 + (iris.y - inner.y)**2)**0.5 / ew
+        avg_v_ratio += ((iris.x - top.x)**2 + (iris.y - top.y)**2)**0.5 / eh
+        valid_eyes += 1
+        
+    if valid_eyes > 0:
+        avg_h_ratio /= valid_eyes
+        avg_v_ratio /= valid_eyes
     
-    if h_dir == "" and v_dir == "": return "Center"
-    return f"{h_dir} {v_dir}".strip()
+    # 3. [최종 판단 로직] Head Pose 우선 적용
+    final_h, final_v = "", ""
+
+    # (1) 좌우 판단: 머리 회전이 크면 눈동자 무시하고 머리 방향 따름
+    # Head Yaw 기준값 (0.5가 정면)
+    # 0.4 미만이면 고개 오른쪽 돌림 / 0.6 초과면 고개 왼쪽 돌림 (값은 튜닝 필요)
+    if yaw < 0.40:    final_h = "Right"  # 고개를 우측으로 돌림
+    elif yaw > 0.60:  final_h = "Left"   # 고개를 좌측으로 돌림
+    else:
+        # 고개가 정면(0.40 ~ 0.60)일 때만 눈동자 확인
+        if avg_h_ratio < 0.44: final_h = "Right"
+        elif avg_h_ratio > 0.56: final_h = "Left"
+    
+    # (2) 상하 판단: 머리 숙임 우선
+    # pitch가 양수면 코가 아래로(Down), 음수면 위로(Up)
+    # Head Pitch 기준값 (사용자마다 다를 수 있음)
+    if pitch < -0.05:   final_v = "Up"     # 고개 듦
+    elif pitch > 0.04:  final_v = "Down"   # 고개 숙임
+    else:
+        # 고개가 정면일 때 눈동자 확인
+        if avg_v_ratio < 0.38: final_v = "Up"
+        elif avg_v_ratio > 0.52: final_v = "Down"
+
+    # 결과 문자열 조합
+    res = f"{final_h} {final_v}".strip()
+    if res == "": res = "Center"
+    
+    # 4. [스무딩] 결과 튀는 현상 방지 (최빈값 사용)
+    gaze_buffer.append(res)
+    # 버퍼에서 가장 많이 등장한 값 선택 (Voting)
+    final_res = max(set(gaze_buffer), key=gaze_buffer.count)
+    
+    # 디버깅용 수치 반환 (튜닝할 때 이 값을 보세요)
+    debug_str = f"Head:{yaw:.2f} Eye:{avg_h_ratio:.2f}"
+    
+    return final_res, debug_str
+# [핵심 수정] 각 ID별로 데이터와 분석 중인지 여부를 개별 저장
+# 예: faces_status[0] = {'data': {...}, 'is_analyzing': False}
+faces_status = {i: {'data': None, 'is_analyzing': False} for i in range(4)}
 
 def draw_styled_panel(img, x, y, w, h, alpha=0.6):
     overlay = img.copy()
