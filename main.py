@@ -5,10 +5,10 @@ import os
 import urllib.request
 import time
 import threading
-from collections import deque
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from deepface import DeepFace
+from collections import deque
 
 # 1. 모델 설정 및 다운로드
 MODEL_FILE = 'face_landmarker.task'
@@ -26,12 +26,20 @@ options = vision.FaceLandmarkerOptions(
 )
 detector = vision.FaceLandmarker.create_from_options(options)
 
-# 인덱스 및 개별 상태 관리 변수
+# 눈 관련
 L_IRIS, R_IRIS = 468, 473
 L_INNER, L_OUTER = 133, 33
+R_INNER, R_OUTER = 362, 263
 L_TOP, L_BOTTOM = 159, 145
 R_TOP, R_BOTTOM = 386, 374
-R_INNER, R_OUTER = 362, 263
+
+# 머리 방향(Head Pose) 관련 (코 끝, 양쪽 귀 근처)
+NOSE_TIP = 1
+L_EAR = 234  # 왼쪽 광대/귀 쪽
+R_EAR = 454  # 오른쪽 광대/귀 쪽
+
+# [안정화] 최근 5프레임의 데이터를 저장할 버퍼 (떨림 방지용)
+gaze_buffer = deque(maxlen=5)
 
 # ==================== 감정 분석 개선 시작 ====================
 
@@ -132,43 +140,96 @@ def get_smoothed_emotion(face_id, raw_emotion_data):
     smoothed_confidence = emotion_avgs[smoothed_emotion]
     
     return smoothed_emotion, smoothed_confidence
+
 # ==================== 감정 분석 개선 끝 ====================
 
-# [핵심 수정] 각 ID별로 데이터와 분석 중인지 여부를 개별 저장
-# 예: faces_status[0] = {'data': {...}, 'is_analyzing': False}
-faces_status = {i: {'data': None, 'is_analyzing': False} for i in range(4)}
+def get_head_pose_ratio(landmarks):
+    """
+    얼굴이 좌우/상하로 얼마나 돌아갔는지 비율로 계산
+    반환값: (yaw_ratio, pitch_ratio)
+    """
+    nose = landmarks[NOSE_TIP]
+    l_ear = landmarks[L_EAR]
+    r_ear = landmarks[R_EAR]
+    
+    # 1. Yaw (좌우 회전) 계산
+    # 양쪽 귀 사이의 거리
+    face_width = ((r_ear.x - l_ear.x)**2 + (r_ear.y - l_ear.y)**2)**0.5
+    if face_width == 0: return 0.5, 0.5
+    
+    # 코가 양쪽 귀 중앙에서 얼마나 벗어났는지 확인
+    yaw_ratio = (nose.x - l_ear.x) / (r_ear.x - l_ear.x)
+    
+    # 2. Pitch (상하 회전) - 약식 계산
+    mid_ear_y = (l_ear.y + r_ear.y) / 2
+    pitch_val = nose.y - mid_ear_y
+    
+    return yaw_ratio, pitch_val
 
 def get_detailed_gaze(landmarks):
-    """Ratio 기반 시선 추적"""
+    """
+    [개선됨] 머리 방향(1순위) + 눈동자(2순위) 하이브리드 추적
+    """
+    global gaze_buffer
+    
+    # 1. 머리 방향(Head Pose) 분석
+    yaw, pitch = get_head_pose_ratio(landmarks)
+    
+    # 2. 눈동자(Eye Gaze) 분석
     avg_h_ratio, avg_v_ratio = 0, 0
     eyes_indices = [
         (L_IRIS, L_INNER, L_OUTER, L_TOP, L_BOTTOM),
         (R_IRIS, R_INNER, R_OUTER, R_TOP, R_BOTTOM)
     ]
     
+    valid_eyes = 0
     for iris_idx, inner_idx, outer_idx, top_idx, bottom_idx in eyes_indices:
-        iris, inner, outer, top, bottom = landmarks[iris_idx], landmarks[inner_idx], landmarks[outer_idx], landmarks[top_idx], landmarks[bottom_idx]
-        eye_width = ((outer.x - inner.x)**2 + (outer.y - inner.y)**2)**0.5
-        if eye_width == 0: continue
-        dist_to_inner = ((iris.x - inner.x)**2 + (iris.y - inner.y)**2)**0.5
-        h_ratio = dist_to_inner / eye_width
-        eye_height = ((bottom.x - top.x)**2 + (bottom.y - top.y)**2)**0.5
-        if eye_height == 0: continue
-        dist_to_top = ((iris.x - top.x)**2 + (iris.y - top.y)**2)**0.5
-        v_ratio = dist_to_top / eye_height
-        avg_h_ratio += h_ratio
-        avg_v_ratio += v_ratio
+        iris = landmarks[iris_idx]
+        inner = landmarks[inner_idx]
+        outer = landmarks[outer_idx]
+        top = landmarks[top_idx]
+        bottom = landmarks[bottom_idx]
 
-    avg_h_ratio /= 2
-    avg_v_ratio /= 2
-    h_dir, v_dir = "", ""
-    if avg_h_ratio < 0.42: h_dir = "Right"
-    elif avg_h_ratio > 0.58: h_dir = "Left"
-    if avg_v_ratio < 0.38: v_dir = "Up"
-    elif avg_v_ratio > 0.55: v_dir = "Down"
+        ew = ((outer.x - inner.x)**2 + (outer.y - inner.y)**2)**0.5
+        eh = ((bottom.x - top.x)**2 + (bottom.y - top.y)**2)**0.5
+        if ew == 0 or eh == 0: continue
+        
+        avg_h_ratio += ((iris.x - inner.x)**2 + (iris.y - inner.y)**2)**0.5 / ew
+        avg_v_ratio += ((iris.x - top.x)**2 + (iris.y - top.y)**2)**0.5 / eh
+        valid_eyes += 1
+        
+    if valid_eyes > 0:
+        avg_h_ratio /= valid_eyes
+        avg_v_ratio /= valid_eyes
     
-    if h_dir == "" and v_dir == "": return "Center"
-    return f"{h_dir} {v_dir}".strip()
+    # 3. 최종 판단 로직
+    final_h, final_v = "", ""
+
+    # 좌우 판단
+    if yaw < 0.40:    final_h = "Right"
+    elif yaw > 0.60:  final_h = "Left"
+    else:
+        if avg_h_ratio < 0.44: final_h = "Right"
+        elif avg_h_ratio > 0.56: final_h = "Left"
+    
+    # 상하 판단
+    if pitch < -0.05:   final_v = "Up"
+    elif pitch > 0.04:  final_v = "Down"
+    else:
+        if avg_v_ratio < 0.38: final_v = "Up"
+        elif avg_v_ratio > 0.52: final_v = "Down"
+
+    res = f"{final_h} {final_v}".strip()
+    if res == "": res = "Center"
+    
+    # 4. 스무딩
+    gaze_buffer.append(res)
+    final_res = max(set(gaze_buffer), key=gaze_buffer.count)
+    
+    return final_res
+
+# [핵심 수정] 각 ID별로 데이터와 분석 중인지 여부를 개별 저장
+faces_status = {i: {'data': None, 'is_analyzing': False} for i in range(4)}
 
 def draw_styled_panel(img, x, y, w, h, alpha=0.6):
     overlay = img.copy()
@@ -180,13 +241,12 @@ def background_analysis(crop_img, idx):
     """[수정] 특정 인덱스의 얼굴만 개별적으로 분석하는 스레드 함수 - 감정 개선 적용"""
     global faces_status
     try:
-        # RetinaFace 사용으로 더 정확한 분석
         result = DeepFace.analyze(
             crop_img, 
             actions=['age', 'gender', 'emotion'],
             enforce_detection=False, 
             silent=True,
-            detector_backend='opencv'  # 더 정확한 검출기
+            detector_backend='opencv'
         )[0]
         
         # 감정 평활화 적용
@@ -202,7 +262,6 @@ def background_analysis(crop_img, idx):
     except Exception as e:
         print(f"Analysis Error for ID {idx+1}: {e}")
     finally:
-        # 해당 인덱스 분석 종료 알림
         faces_status[idx]['is_analyzing'] = False
 # ==================== 감정 분석 함수 수정 끝 ====================
 
@@ -234,29 +293,27 @@ while cap.isOpened():
 
     if result.face_landmarks:
         for idx, landmarks in enumerate(result.face_landmarks):
-            if idx >= 4: break # 설정한 num_faces=4 까지만 처리
+            if idx >= 4: break
             
             gaze = get_detailed_gaze(landmarks)
             x_pts = [l.x * w for l in landmarks]
             y_pts = [l.y * h for l in landmarks]
             x1, y1, x2, y2 = int(min(x_pts)), int(min(y_pts)), int(max(x_pts)), int(max(y_pts))
 
-            # ==================== 분석 주기 수정 (20프레임마다로 변경) ====================
-            # [수정] 개별 분석 로직: 이 ID(idx)가 현재 분석 중이 아닐 때만 20프레임마다 실행
+            # ==================== 분석 주기 수정 (20프레임마다) ====================
             if (frame_count % 20 == 0 or frame_count < 5) and not faces_status[idx]['is_analyzing']:
                 margin = int((x2-x1)*0.2)
                 crop = frame[max(0, y1-margin):min(h, y2+margin), max(0, x1-margin):min(w, x2+margin)]
                 if crop.size > 0:
                     faces_status[idx]['is_analyzing'] = True
                     threading.Thread(target=background_analysis, args=(crop.copy(), idx), daemon=True).start()
-            # ==================== 분석 주기 수정 끝 ====================
-            
+            # ====================================================================
+
             # UI 표시 로직
             panel_y = 65 + (idx * 85)
             cv2.line(frame, (20, panel_y-5), (300, panel_y-5), (80, 80, 80), 1)
             
             # ==================== 감정 표시 수정 ====================
-            # 각 ID별 저장된 데이터 가져와서 표시
             if faces_status[idx]['data']:
                 d = faces_status[idx]['data']
                 gender = "M" if d['dominant_gender'] == 'Man' else "W"
@@ -274,11 +331,11 @@ while cap.isOpened():
                 cv2.putText(frame, emo, (25, panel_y + 42), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
             else:
                 cv2.putText(frame, f"ID:{idx+1} Initializing...", (25, panel_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
-            # ==================== 감정 표시 수정 끝 ====================
-            
+            # ===================================================
+
             cv2.putText(frame, f"Gaze: {gaze}", (25, panel_y + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             
-            # 얼굴 박스 및 번호 (분석 중일 때는 노란색으로 표시)
+            # 얼굴 박스 및 번호
             box_color = (0, 255, 255) if faces_status[idx]['is_analyzing'] else (0, 255, 0)
             cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 1)
             cv2.putText(frame, f"FACE {idx+1}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 1)
