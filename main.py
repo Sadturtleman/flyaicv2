@@ -255,27 +255,63 @@ def draw_styled_panel(img, x, y, w, h, alpha=0.6):
 
 # ==================== 감정 분석 함수 수정 ====================
 def background_analysis(crop_img, idx):
-    """[수정] 특정 인덱스의 얼굴만 개별적으로 분석하는 스레드 함수 - 감정 개선 적용"""
+    """특정 인덱스의 얼굴만 개별적으로 분석 + (나이/성별) 스무딩/보정, 감정은 원본 유지"""
     global faces_status
     try:
-        result = DeepFace.analyze(
-            crop_img, 
+        # --- Preprocess: 안정화 (과노화/미검출 줄임) ---
+        face_bgr = cv2.resize(crop_img, (224, 224), interpolation=cv2.INTER_LINEAR)
+        face_bgr = cv2.GaussianBlur(face_bgr, (3, 3), 0)
+        face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
+
+        # --- Analyze (crop 했으니 detector는 skip이 흔들림 적음) ---
+        res = DeepFace.analyze(
+            face_rgb,
             actions=['age', 'gender', 'emotion'],
-            enforce_detection=False, 
-            silent=True,
-            detector_backend='opencv'
+            detector_backend='skip',
+            enforce_detection=False,
+            silent=True
         )[0]
-        
-        # 감정 평활화 적용
-        raw_emotion = result['emotion']
-        smoothed_emotion, smoothed_conf = get_smoothed_emotion(idx, raw_emotion)
-        
-        # 개선된 감정 정보 추가
-        result['smoothed_emotion'] = smoothed_emotion
-        result['smoothed_confidence'] = smoothed_conf
-        
-        # 해당 인덱스 슬롯에 결과 저장
-        faces_status[idx]['data'] = result
+
+        prev = faces_status[idx]['data'] or {}
+        alpha = 0.2  # 0.1이면 더 부드럽게(느림), 0.3이면 더 빠르게(튐 증가)
+
+        # =========================
+        # AGE: 보정 + 스무딩
+        # =========================
+        if 'age' in res:
+            age_cal = float(res['age']) - 4
+
+            # 말도 안되게 튀는 값 제한
+            age_cal = max(5, min(80, age_cal))
+
+            if isinstance(prev.get('age'), (int, float)):
+                age_cal = (1 - alpha) * float(prev['age']) + alpha * age_cal
+
+            res['age'] = int(round(age_cal))
+
+        # =========================
+        # GENDER: dict 기반이면 EMA로 안정화
+        # =========================
+        if isinstance(res.get('gender'), dict):
+            ema_g = prev.get('_ema_gender', {'Man': None, 'Woman': None})
+            for k in ['Man', 'Woman']:
+                if k in res['gender']:
+                    v = float(res['gender'][k])
+                    ema_g[k] = v if ema_g.get(k) is None else (1 - alpha) * float(ema_g[k]) + alpha * v
+            res['_ema_gender'] = ema_g
+
+            man = ema_g.get('Man') or 0.0
+            wom = ema_g.get('Woman') or 0.0
+            res['dominant_gender'] = 'Man' if man >= wom else 'Woman'
+        else:
+            if isinstance(res.get('dominant_gender'), str):
+                res['dominant_gender'] = res['dominant_gender']
+
+        # --- 기존 값 유지하면서 업데이트 (EMA 상태도 유지됨) ---
+        merged = dict(prev)
+        merged.update(res)
+        faces_status[idx]['data'] = merged
+
     except Exception as e:
         print(f"Analysis Error for ID {idx+1}: {e}")
     finally:
